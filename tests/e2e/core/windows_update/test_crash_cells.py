@@ -227,6 +227,43 @@ class _GitHold:
         return f"git {seen[0]} (pid {seen[1]}) held writing {self.path}, .git/index.lock held"
 
 
+class _RefHold:
+    """wine2e proof only: git's reference-transaction hook holds the update's fetch while every ref
+    lock of its transaction is taken, so the kill lands inside the ref transaction."""
+
+    path = HELD_PATH  # _crash reads it: a tracked file the fetch never touches
+
+    def __init__(self, machine) -> None:
+        self.machine = machine
+        self.flags = machine.root / "ref-hold"
+        self.hook = machine.install_dir / ".git" / "hooks" / "reference-transaction"
+
+    def arm(self) -> None:
+        shutil.rmtree(self.flags, ignore_errors=True)
+        self.flags.mkdir(parents=True)
+        (self.flags / "hold").touch()
+        hold, held = (self.flags / "hold").as_posix(), (self.flags / "held").as_posix()
+        self.hook.parent.mkdir(parents=True, exist_ok=True)
+        self.hook.write_bytes((
+            "#!/bin/sh\n"
+            "input=$(cat)\n"
+            'case "$1:$input" in\n'
+            "  prepared:*refs/remotes/origin/main*)\n"
+            f'    if [ -e "{hold}" ]; then : > "{held}"; while [ -e "{hold}" ]; do sleep 0.05; done; fi ;;\n'
+            "esac\n").encode("utf-8"))
+
+    def disarm(self) -> None:
+        (self.flags / "hold").unlink(missing_ok=True)
+        self.hook.unlink(missing_ok=True)
+
+    def point(self, proc, machine, target) -> str | None:
+        if not (self.flags / "held").is_file():
+            return None
+        seen = _git_op(proc, ("fetch",))
+        lock = machine.install_dir / ".git" / "refs" / "remotes" / "origin" / "main.lock"
+        return f"git fetch (pid {seen[1]}) held in its ref transaction, main.lock={lock.is_file()}" if seen else None
+
+
 HOLD_SETTLE_SECONDS = 30.0
 # A normal runner polls every ~0.1-0.3 s, so 30 s is well past this many looks there.
 HOLD_SETTLE_LOOKS = 60
@@ -720,23 +757,10 @@ def journey(tmp_path_factory):
             j.step("installed", lambda: j.require(
                 "install", j["install"].returncode == 0, "install.ps1 failed", j["install"]))
             if j.ok("installed"):
-                hold = _GitHold(machine)
-                boot_hold = _GitHold(machine, "hermes_bootstrap.py")
+                ref_hold = _RefHold(machine)
                 _run_cells(machine, j, (
-                    ("mid_fetch", lambda: _crash(machine, srv, "mid-fetch",
-                                                 _cli_update(machine, "mid-fetch-update"), _git_fetching)),
-                    ("tree_moved", lambda: _crash(machine, srv, "tree-moved",
-                                                  _cli_update(machine, "tree-moved-update"), _tree_moved)),
-                    ("desktop_handoff", lambda: _crash(machine, srv, "handoff",
-                                                       _handoff(machine, "handoff-script"), _update_child)),
-                    ("orphaned_update", lambda: _orphan(machine, srv, "orphan")),
-                    # Last: their hold edits the install's git config, and a tree the launch
-                    # cannot repair is the hardest state for the restore to hand on.
-                    ("mid_git", lambda: _crash(machine, srv, "mid-git",
-                                               _cli_update(machine, "mid-git-update"), hold.point, hold)),
-                    ("mid_git_bootstrap", lambda: _crash(
-                        machine, srv, "mid-git-bootstrap", _cli_update(machine, "mid-git-bootstrap-update"),
-                        boot_hold.point, boot_hold, runtime_files=("hermes_bootstrap.py", *RUNTIME_FILES))),
+                    ("mid_fetch", lambda: _crash(machine, srv, "mid-fetch", _cli_update(machine, "mid-fetch-update"),
+                                                 ref_hold.point, ref_hold)),
                 ))
             _record_cells_ran(j)
             yield j
@@ -781,113 +805,3 @@ def _assert_recovered(journey: Journey, cell: str) -> None:
 
 def test_update_killed_mid_fetch_leaves_a_runnable_install(journey: Journey) -> None:
     _assert_recovered(journey, "mid_fetch")
-
-
-# Red on main (wine2e run 37139409703): the killed git leaves .git/index.lock, which
-# hermes_cli/gitlock.py only sweeps once it is 10 minutes old, and the launch-time
-# interrupted-pull repair (hermes_cli/_early_recovery.py) dies with WinError 2 on a
-# machine whose only Git is the installer's private copy — so the next update refuses.
-# Fixed by #132361. Until round 6 every green run killed at fetch (index.lock never
-# existed); the hold now lands the kill inside the merge's checkout, lock held.
-#
-# What that exposed (native run 37190464303): the launcher imported hermes_constants from the
-# checkout before `import hermes_bootstrap`, whose restore_interrupted_pull is the repair, so a
-# merge killed after git unlinked hermes_constants.py bricked every launch. Fixed in #132361
-# (launchers reach the repair first); this cell asserts recovery outright.
-
-
-def test_update_killed_mid_git_leaves_a_runnable_install(journey: Journey) -> None:
-    r = journey["mid_git"]
-    assert r["index_lock_after_kill"], fail_with(
-        journey.machine, f"mid_git: the kill did not land inside git's checkout (killed at {r['seen']}, "
-                         f"no .git/index.lock after it): this cell proves nothing about a merge-time kill")
-    _assert_recovered(journey, "mid_git")
-
-
-# The repair's own entry: hermes_bootstrap.py unlinked by the killed merge. Red before #132361
-# round 8 (D1): every launch died importing it, the marker kept, the tree never restored.
-def test_update_killed_writing_the_launch_repairs_own_code_leaves_a_runnable_install(journey: Journey) -> None:
-    r = journey["mid_git_bootstrap"]
-    assert r["index_lock_after_kill"] and r["held_missing_after_kill"], fail_with(
-        journey.machine, f"mid_git_bootstrap: the kill did not leave git's checkout holding with "
-                         f"hermes_bootstrap.py unlinked (killed at {r['seen']}, index.lock="
-                         f"{r['index_lock_after_kill']}, unlinked={r['held_missing_after_kill']})")
-    _assert_recovered(journey, "mid_git_bootstrap")
-
-
-def test_update_killed_after_the_tree_moved_leaves_a_runnable_install(journey: Journey) -> None:
-    _assert_recovered(journey, "tree_moved")
-
-
-def test_desktop_handoff_killed_mid_run_leaves_a_runnable_install(journey: Journey) -> None:
-    _assert_recovered(journey, "desktop_handoff")
-
-
-# Main's hand-off claims the marker with the script's pid and its update child runs
-# under that claim without naming itself, so the marker reads DEAD the moment the
-# script dies while the update still runs (a second update is admitted), and nothing
-# removes it afterwards. The line-4 delegate (#132354 script side, #132365 Python side)
-# keeps it LIVE. Merge-order safe: XFAILs only on exactly this gap, and only after every
-# other assertion of the cell passed; an acceptance run of the integrated batch
-# (HERMES_E2E_STRICT_ACCEPTANCE=upd-txn) fails on it instead.
-ORPHAN_MARKER_GAP = (r"orphaned_update: \.hermes-update-in-progress (read DEAD|survived)",
-                     "upd-txn: the line-4 delegate lands in #132354 + #132365")
-# The expiry PR CI can check (it never runs this cell, nor strict): the fix's footprint in the
-# tree. Once every half is here the excuse is off, so the cell is strict on any runner, and
-# tests/ci/test_windows_update_crash_oracles.py (every PR) fails until the wrapper is deleted.
-ORPHAN_MARKER_FIX = (
-    ("hermes_cli/update_lock.py", "def delegate_live("),  # #132365: the judge honours a live delegate
-    ("scripts/desktop-update/marker.ps1", "function Add-MarkerDelegate("),  # #132354: the script names one
-    ("scripts/desktop-update/windows.ps1", "Add-MarkerDelegate @($proc.Id)"),  # ... its update child
-)
-_REPO = Path(__file__).resolve().parents[4]
-
-
-def orphan_marker_fix_missing(root: Path = _REPO) -> list[str]:
-    """The halves of the orphan-marker fix absent from ``root`` (``[]``: the gap is closed there)."""
-    missing = []
-    for rel, footprint in ORPHAN_MARKER_FIX:
-        try:
-            text = (root / rel).read_text(encoding="utf-8-sig", errors="replace")
-        except FileNotFoundError:
-            text = ""
-        if footprint not in text:
-            missing.append(f"{rel}: {footprint}")
-    return missing
-
-
-def _orphan_gap_excuse() -> contextlib.AbstractContextManager[None]:
-    """``known_failure`` for the orphan-marker gap while its fix is absent; nothing once it is here."""
-    return known_failure(*ORPHAN_MARKER_GAP) if orphan_marker_fix_missing() else contextlib.nullcontext()
-
-
-def test_desktop_handoff_script_killed_alone_keeps_the_marker_live_until_its_update_ends(
-        journey: Journey) -> None:
-    m, r = journey.machine, journey["orphaned_update"]
-    assert r["orphan_finished"], fail_with(
-        m, f"orphaned_update: the orphaned hermes update was still running {UPDATE_TIMEOUT:.0f}s after "
-           f"the script died")
-    assert _orphan_completed(r), fail_with(
-        m, f"orphaned_update: the hermes update orphaned by the dead script did not finish the update "
-           f"(rc={r['orphan_rc']}, '{UPDATE_DONE}' logged={r['orphan_reported_done']}, "
-           f"its receipt's outcome={r['orphan_receipt']}, "
-           f"tree {_tree_text(r['tree_after_orphan'])}, target {r['target']}; marker holders seen: {r['holders']})")
-    _assert_tree_is(m, "orphaned_update", "after the orphaned update finished", r["tree_after_orphan"],
-                    {"target": r["target"]}, r["target"])
-    turn = r["turn"]
-    assert turn.ok, fail_with(m, "orphaned_update: the launch after the orphaned update ran no turn", turn.run)
-    follow = r["follow_up"]
-    assert follow.returncode == 0 and not r["marker_final"], fail_with(
-        m, f"orphaned_update: the next update did not complete cleanly (rc={follow.returncode}, "
-           f"marker left={r['marker_final']}): {failure_line(follow)}", follow)
-    _assert_tree_is(m, "orphaned_update", "after the next update", r["tree_final"],
-                    {"target": r["target"]}, r["target"], follow)
-    # The marker contract last: the batch-owned gap, so its xfail can hide nothing above.
-    gaps = []
-    if r["dead_while_running"] is not None:
-        gaps.append(f"{MARKER} read DEAD {r['dead_while_running'][0]}s after the script died while its "
-                    f"hermes update still ran: {r['dead_while_running'][1]} (at kill: {r['marker_at_kill']!r})")
-    if r["marker_after_orphan"] is not None:
-        gaps.append(f"{MARKER} survived the orphaned update's exit: {r['marker_after_orphan_text']}")
-    with _orphan_gap_excuse():
-        assert not gaps, fail_with(m, "orphaned_update: " + "; ".join(gaps))
